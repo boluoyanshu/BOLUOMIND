@@ -82,12 +82,68 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     k_embed = k * cos.unsqueeze(unsqueeze_dim) + rotate_half(k) * sin.unsqueeze(unsqueeze_dim)
     return q_embed,k_embed
 
-q=torch.randn(2,4,2,8)
-k=torch.randn(2,4,2,8)
-cos,sin=precompute_freqs_cis(8,4)
-q_embed,k_embed=apply_rotary_pos_emb(q,k,cos,sin)
-print(q_embed.size())
-rope_scaling = {}
-cos, sin = precompute_freqs_cis(8, 4, rope_scaling=rope_scaling)
-q_embed,k_embed=apply_rotary_pos_emb(q,k,cos,sin)
-print(q_embed.size())
+def repeat_kv(x:torch.Tensor,num_rep:int)->torch.Tensor:
+    if num_rep==1:
+        return x
+    return x.repeat_interleave(num_rep,dim=2)
+class Attention(nn.Module):
+    def __init__(self,config:MiniMindConfig):
+        super().__init__()
+        self.num_key_value_heads=config.num_attention_heads if config.num_key_value_heads is None else config.num_key_value_heads
+        self.n_local_heads=config.num_attention_heads
+        self.n_local_kv_heads=config.num_key_value_heads
+        assert not config.hidden_size%config.num_attention_heads
+        self.head_dim=config.head_dim
+
+        self.is_casual=True
+
+        self.q_proj=nn.Linear(config.hidden_size,self.n_local_heads*self.head_dim,bias=False)
+        self.k_proj=nn.Linear(config.hidden_size,self.num_key_value_heads*self.head_dim,bias=False)
+        self.v_proj=nn.Linear(config.hidden_size,self.num_key_value_heads*self.head_dim,bias=False)
+        self.out_proj=nn.Linear(self.n_local_heads*self.head_dim,config.hidden_size,bias=False)
+
+        self.q_norm=RMSNorm(config.head_dim,eps=config.rms_norm_eps)
+        self.k_norm = RMSNorm(config.head_dim, eps=config.rms_norm_eps)
+
+        self.atten_dropout=nn.Dropout(config.dropout)
+        self.resid_dropout=nn.Dropout(config.dropout)
+        self.dropout=config.dropout
+
+        self.flash=hasattr(torch.nn.functional,'scaled_dot_product_attention') and config.flash_attn
+
+
+
+    def forward(self, x, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+        bsz,seq,_=x.shape
+        xq,xk,xv=self.q_proj(x),self.k_proj(x),self.v_proj(x)
+        xq=xq.view(bsz,seq,self.n_local_heads,self.head_dim)
+        xk = xk.view(bsz, seq, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seq, self.n_local_kv_heads, self.head_dim)
+
+        xq=self.q_norm(xq)
+        xk = self.k_norm(xk)
+
+        cos,sin=position_embeddings
+        xq,xk=apply_rotary_pos_emb(xq,xk,cos[:seq],sin[:seq])
+
+        if past_key_value is not None:
+            xk=torch.cat([past_key_value[0],xk],dim=1)
+            xv = torch.cat([past_key_value[1], xv], dim=1)
+        if use_cache:
+            present_key_value=(xk,xv)
+        else:
+            present_key_value=None
+
+        xq,xk,xv=xq.transpose(1,2),repeat_kv(xk,self.n_local_heads//self.n_local_kv_heads).transpose(1,2),repeat_kv(xv,self.n_local_heads//self.n_local_kv_heads).transpose(1,2)
+
+        if self.flash and seq>1 and (not self.is_casual or past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
+            output= F.scaled_dot_product_attention(xq,xk,xv,dropout_p=self.dropout if self.training else 0.0,is_causal=self.is_casual)
+        else:
+            scores=xq@xk.transpose(-1,-2)/math.sqrt(self.head_dim)
+            if self.is_casual:
+                scores[...,-seq:]+=torch.full((seq,seq),float("-inf"),device=scores.device).triu(1)
+            if attention_mask is not None:
+                scores+=(1.0-attention_mask.unsqueeze(1).unsqueeze(2))*-1e9
+            output=self.atten_dropout(torch.softmax(scores,-1))@xv
+        output=output.transpose(1,2).reshape(bsz,seq,-1)
+        return self.resid_dropout(output),present_key_value
