@@ -147,3 +147,32 @@ class Attention(nn.Module):
             output=self.atten_dropout(torch.softmax(scores,-1))@xv
         output=output.transpose(1,2).reshape(bsz,seq,-1)
         return self.resid_dropout(output),present_key_value
+
+class FeedForward(nn.Module):
+    def __init__(self, config: MiniMindConfig, intermediate_size: int = None):
+        super().__init__()
+        intermediate_size=intermediate_size or config.intermediate_size
+        self.up_proj=nn.Linear(config.hidden_size,intermediate_size,bias=False)
+        self.act=ACT2FN[config.hidden_act]
+        self.gate=nn.Linear(config.hidden_size,intermediate_size,bias=False)
+        self.down_proj=nn.Linear(intermediate_size,config.hidden_size,bias=False)
+        self.dropout=nn.Dropout(config.dropout)
+
+    def forward(self,x):
+        return self.dropout(self.down_proj(self.up_proj(x)*self.act(self.gate(x))))
+
+class MiniMindBlock(nn.Module):
+    def __init__(self, layer_id: int, config: MiniMindConfig):
+        super.__init__()
+        self.attention=Attention(config)
+        self.input_layernorm=RMSNorm(config.hidden_size,eps=config.rms_norm_eps)
+        self.post_attention_layernorm=RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp=FeedForward(config)
+
+    def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False,
+                    attention_mask=None):
+        residual=hidden_states
+        hidden_states,present_key_value=self.attention(self.input_layernorm(hidden_states),position_embeddings,past_key_value,use_cache,attention_mask)
+        hidden_states+=residual
+        hidden_states=self.mlp(self.post_attention_layernorm(hidden_states))+hidden_states
+        return hidden_states,present_key_value
