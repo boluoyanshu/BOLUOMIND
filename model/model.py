@@ -2,7 +2,7 @@ import math, torch, torch.nn.functional as F
 from torch import nn
 from transformers.activations import ACT2FN
 from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
-from transformers.modeling_outputs import MoeCausalLMOutputWithPast
+from transformers.modeling_outputs import MoeCausalLMOutputWithPast,CausalLMOutputWithPast
 
 
 class MiniMindConfig(PretrainedConfig):
@@ -176,3 +176,60 @@ class MiniMindBlock(nn.Module):
         hidden_states+=residual
         hidden_states=self.mlp(self.post_attention_layernorm(hidden_states))+hidden_states
         return hidden_states,present_key_value
+
+class BoluoMindModel(nn.Module):
+    def __init__(self,config:MiniMindConfig):
+        super.__init__()
+        self.config=config
+        self.vocab_size,self.hidden_layers,self.hidden_size=config.vocab_size,config.num_hidden_layers,config.hidden_size
+        self.embed_tokens=nn.Embedding(self.vocab_size,self.hidden_size)
+        self.layers=nn.ModuleList([MiniMindBlock(i,config) for i in range(self.hidden_layers)])
+        self.norm=RMSNorm(self.hidden_size,eps=config.rms_norm_eps)
+        self.dropout=nn.Dropout(config.dropout)
+        freq_cos,freq_sin=precompute_freqs_cis(config.head_dim,config.max_position_embeddings,rope_base=config.rope_theta,rope_scaling=config.rope_scaling)
+        self.register_buffer("freq_cos",freq_cos, persistent=False)
+        self.register_buffer("freq_sin",freq_sin, persistent=False)
+
+    def forward(self,input_ids,attention_mask=None,past_key_values=None,use_cache=False):
+        bsz,seq_len=input_ids.shape
+        if hasattr(past_key_values, 'layers'): past_key_values = None
+        past_key_values=past_key_values or [None]*self.hidden_layers
+        hidden_states=self.dropout(self.embed_tokens(input_ids))
+        start_pos=0 if past_key_values[0] is None else past_key_values[0][0].shape[1]
+        if self.freqs_cos[0, 0] == 0:
+            freqs_cos, freqs_sin = precompute_freqs_cis(dim=self.config.head_dim, end=self.config.max_position_embeddings, rope_base=self.config.rope_theta, rope_scaling=self.config.rope_scaling)
+            self.freqs_cos, self.freqs_sin = freqs_cos.to(hidden_states.device), freqs_sin.to(hidden_states.device)
+        postion_embeddings=(self.freqs_cos[start_pos:start_pos+seq_len],self.freqs_sin[start_pos:start_pos+seq_len])
+        presents=[]
+        for layer,past_key_value in zip(self.layers,past_key_values):
+            hidden_states,present=layer(hidden_states,postion_embeddings,past_key_value,use_cache,attention_mask)
+            presents.append(present)
+        hidden_states=self.norm(hidden_states)
+        # aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)],
+        #                hidden_states.new_zeros(1).squeeze())
+        return hidden_states,presents
+
+class BoluoCasualModel(PreTrainedModel,GenerationMixin):
+    config_class = MiniMindConfig
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+    def __init__(self,config:MiniMindConfig):
+        self.config=config
+        super().__init__(config)
+        self.model=BoluoMindModel(config)
+        self.lm_head=nn.Linear(config.hidden_size,config.vocab_size)
+        if config.tie_word_embeddings:
+            self.lm_head.weight=self.model.embed_tokens.weight
+        self.post_init()
+
+    def forward(self,input_ids,attention_mask=None,past_key_values=None,use_cache=False,labels=None,logits_to_keep=0,**kwargs):
+        hidden_states,past_key_values=self.model(
+            input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+        )
+        logits_slice=slice(-logits_to_keep,None) if isinstance(logits_to_keep,int) else logits_to_keep
+        logits=self.lm_head(hidden_states[:,logits_slice,:])
+        loss=None
+        output=CausalLMOutputWithPast(loss=loss,logits=logits,past_key_values=past_key_values,hidden_states=hidden_states)
+        return output
