@@ -146,6 +146,7 @@ class Attention(nn.Module):
                 scores+=(1.0-attention_mask.unsqueeze(1).unsqueeze(2))*-1e9
             output=self.atten_dropout(torch.softmax(scores,-1))@xv
         output=output.transpose(1,2).reshape(bsz,seq,-1)
+        output=self.out_proj(output)
         return self.resid_dropout(output),present_key_value
 
 class FeedForward(nn.Module):
@@ -163,7 +164,7 @@ class FeedForward(nn.Module):
 
 class MiniMindBlock(nn.Module):
     def __init__(self, layer_id: int, config: MiniMindConfig):
-        super.__init__()
+        super().__init__()
         self.attention=Attention(config)
         self.input_layernorm=RMSNorm(config.hidden_size,eps=config.rms_norm_eps)
         self.post_attention_layernorm=RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -173,13 +174,13 @@ class MiniMindBlock(nn.Module):
                     attention_mask=None):
         residual=hidden_states
         hidden_states,present_key_value=self.attention(self.input_layernorm(hidden_states),position_embeddings,past_key_value,use_cache,attention_mask)
-        hidden_states+=residual
+        hidden_states=hidden_states+residual
         hidden_states=self.mlp(self.post_attention_layernorm(hidden_states))+hidden_states
         return hidden_states,present_key_value
 
 class BoluoMindModel(nn.Module):
     def __init__(self,config:MiniMindConfig):
-        super.__init__()
+        super().__init__()
         self.config=config
         self.vocab_size,self.hidden_layers,self.hidden_size=config.vocab_size,config.num_hidden_layers,config.hidden_size
         self.embed_tokens=nn.Embedding(self.vocab_size,self.hidden_size)
@@ -187,8 +188,8 @@ class BoluoMindModel(nn.Module):
         self.norm=RMSNorm(self.hidden_size,eps=config.rms_norm_eps)
         self.dropout=nn.Dropout(config.dropout)
         freq_cos,freq_sin=precompute_freqs_cis(config.head_dim,config.max_position_embeddings,rope_base=config.rope_theta,rope_scaling=config.rope_scaling)
-        self.register_buffer("freq_cos",freq_cos, persistent=False)
-        self.register_buffer("freq_sin",freq_sin, persistent=False)
+        self.register_buffer("freqs_cos",freq_cos, persistent=False)
+        self.register_buffer("freqs_sin",freq_sin, persistent=False)
 
     def forward(self,input_ids,attention_mask=None,past_key_values=None,use_cache=False):
         bsz,seq_len=input_ids.shape
@@ -205,9 +206,8 @@ class BoluoMindModel(nn.Module):
             hidden_states,present=layer(hidden_states,postion_embeddings,past_key_value,use_cache,attention_mask)
             presents.append(present)
         hidden_states=self.norm(hidden_states)
-        # aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)],
-        #                hidden_states.new_zeros(1).squeeze())
-        return hidden_states,presents
+        aux_loss = None
+        return hidden_states,presents,aux_loss
 
 class BoluoCasualModel(PreTrainedModel,GenerationMixin):
     config_class = MiniMindConfig
@@ -222,7 +222,7 @@ class BoluoCasualModel(PreTrainedModel,GenerationMixin):
         self.post_init()
 
     def forward(self,input_ids,attention_mask=None,past_key_values=None,use_cache=False,labels=None,logits_to_keep=0,**kwargs):
-        hidden_states,past_key_values=self.model(
+        hidden_states,past_key_values,aux_loss=self.model(
             input_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
@@ -231,5 +231,8 @@ class BoluoCasualModel(PreTrainedModel,GenerationMixin):
         logits_slice=slice(-logits_to_keep,None) if isinstance(logits_to_keep,int) else logits_to_keep
         logits=self.lm_head(hidden_states[:,logits_slice,:])
         loss=None
-        output=CausalLMOutputWithPast(loss=loss,logits=logits,past_key_values=past_key_values,hidden_states=hidden_states)
+        if labels is not None:
+            x, y = logits[..., :-1, :].contiguous(), labels[..., 1:].contiguous()
+            loss = F.cross_entropy(x.view(-1, x.size(-1)), y.view(-1), ignore_index=-100)
+        output=MoeCausalLMOutputWithPast(aux_loss=aux_loss,loss=loss,logits=logits,past_key_values=past_key_values,hidden_states=hidden_states)
         return output
