@@ -162,13 +162,43 @@ class FeedForward(nn.Module):
     def forward(self,x):
         return self.dropout(self.down_proj(self.up_proj(x)*self.act(self.gate(x))))
 
+class MOEFeedForward(nn.Module):
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        self.config = config
+        self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
+        self.experts = nn.ModuleList([FeedForward(config, intermediate_size=config.moe_intermediate_size) for _ in range(config.num_experts)])
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, x):
+        batch_size, seq_len, hidden_dim = x.shape
+        x_flat = x.view(-1, hidden_dim)
+        scores = F.softmax(self.gate(x_flat), dim=-1)
+        topk_weight, topk_idx = torch.topk(scores, k=self.config.num_experts_per_tok, dim=-1, sorted=False)
+        if self.config.norm_topk_prob: topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-20)
+        y = torch.zeros_like(x_flat)
+        for i, expert in enumerate(self.experts):
+            mask = (topk_idx == i)
+            if mask.any():
+                token_idx = mask.any(dim=-1).nonzero().flatten()
+                weight = topk_weight[mask].view(-1, 1)
+                y.index_add_(0, token_idx, (expert(x_flat[token_idx]) * weight).to(y.dtype))
+            elif self.training:
+                y[0, 0] += 0 * sum(p.sum() for p in expert.parameters())
+        if self.training and self.config.router_aux_loss_coef > 0:
+            load = F.one_hot(topk_idx, self.config.num_experts).float().mean(0)
+            self.aux_loss = (load * scores.mean(0)).sum() * self.config.num_experts * self.config.router_aux_loss_coef
+        else:
+            self.aux_loss = scores.new_zeros(1).squeeze()
+        return y.view(batch_size, seq_len, hidden_dim)
+
 class MiniMindBlock(nn.Module):
     def __init__(self, layer_id: int, config: MiniMindConfig):
         super().__init__()
         self.attention=Attention(config)
         self.input_layernorm=RMSNorm(config.hidden_size,eps=config.rms_norm_eps)
         self.post_attention_layernorm=RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mlp=FeedForward(config)
+        self.mlp=FeedForward(config) if not config.use_moe else MOEFeedForward(config)
 
     def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False,
                     attention_mask=None):
@@ -206,7 +236,7 @@ class BoluoMindModel(nn.Module):
             hidden_states,present=layer(hidden_states,postion_embeddings,past_key_value,use_cache,attention_mask)
             presents.append(present)
         hidden_states=self.norm(hidden_states)
-        aux_loss = None
+        aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)], hidden_states.new_zeros(1).squeeze())
         return hidden_states,presents,aux_loss
 
 class BoluoCasualModel(PreTrainedModel,GenerationMixin):
