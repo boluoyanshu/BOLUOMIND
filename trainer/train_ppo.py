@@ -19,7 +19,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.nn.utils import clip_grad_norm_
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from model.model import MiniMindConfig, BoluoMindModel
+from model.model import MiniMindConfig, BoluoCasualModel
 from dataset.lm_dataset import RLAIFDataset
 from trainer.trainer_utils import Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, SkipBatchSampler, init_model, LMForRewardModel
 from trainer.rollout_engine import create_rollout_engine
@@ -34,7 +34,7 @@ def rep_penalty(text, n=3, cap=0.5):
 
 
 # 自定义的Critic模型，继承自MiniMindLM
-class CriticModel(BoluoMindModel):
+class CriticModel(BoluoCasualModel):
     def __init__(self, params):
         super().__init__(params)
         # 替换lm_head为输出单一价值的线性层
@@ -43,7 +43,8 @@ class CriticModel(BoluoMindModel):
     def forward(self, input_ids=None, attention_mask=None, **kwargs):
         # 使用基础模型获取隐藏状态
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
-        hidden_states = self.model.norm(outputs[0])
+        # hidden_states = self.model.norm(outputs[0])
+        hidden_states = outputs[0]
         # 使用value_head获取价值估计
         values = self.value_head(hidden_states).squeeze(-1)
         return values
