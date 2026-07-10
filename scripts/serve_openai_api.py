@@ -17,7 +17,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
-from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
+from model.model import MiniMindConfig, BoluoCasualModel
 from model.model_lora import apply_lora, load_lora
 
 warnings.filterwarnings('ignore')
@@ -30,7 +30,7 @@ def init_model(args):
     if 'model' in args.load_from:
         moe_suffix = '_moe' if args.use_moe else ''
         ckp = f'../{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
-        model = MiniMindForCausalLM(MiniMindConfig(
+        model = BoluoCasualModel(MiniMindConfig(
             hidden_size=args.hidden_size,
             num_hidden_layers=args.num_hidden_layers,
             max_seq_len=args.max_seq_len,

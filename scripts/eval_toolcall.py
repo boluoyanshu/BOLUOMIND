@@ -11,7 +11,7 @@ import torch
 from datetime import datetime
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
 from openai import OpenAI
-from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
+from model.model import MiniMindConfig, BoluoCasualModel
 from trainer.trainer_utils import setup_seed, get_model_params
 warnings.filterwarnings('ignore')
 
@@ -57,7 +57,7 @@ TEST_CASES = [
 def init_model(args):
     tokenizer = AutoTokenizer.from_pretrained(args.load_from)
     if 'model' in args.load_from:
-        model = MiniMindForCausalLM(MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe)))
+        model = BoluoCasualModel(MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe)))
         moe_suffix = '_moe' if args.use_moe else ''
         ckp = f'./{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
         model.load_state_dict(torch.load(ckp, map_location=args.device), strict=True)

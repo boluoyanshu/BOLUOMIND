@@ -2,7 +2,7 @@ from openai import OpenAI
 
 client = OpenAI(
     api_key="sk-123",
-    base_url="http://localhost:11434/v1"
+    base_url="http://localhost:8998/v1"
 )
 stream = True
 conversation_history_origin = []

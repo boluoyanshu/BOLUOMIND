@@ -8,15 +8,15 @@ import torch
 import transformers
 import warnings
 from transformers import AutoTokenizer, AutoModelForCausalLM, Qwen3Config, Qwen3ForCausalLM, Qwen3MoeConfig, Qwen3MoeForCausalLM
-from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
+from model.model import MiniMindConfig, BoluoCasualModel
 from model.model_lora import apply_lora, merge_lora
 
 warnings.filterwarnings('ignore', category=UserWarning)
 
 def convert_torch2transformers_minimind(torch_path, transformers_path, dtype=torch.float16):
     MiniMindConfig.register_for_auto_class()
-    MiniMindForCausalLM.register_for_auto_class("AutoModelForCausalLM")
-    lm_model = MiniMindForCausalLM(lm_config)
+    BoluoCasualModel.register_for_auto_class("AutoModelForCausalLM")
+    lm_model = BoluoCasualModel(lm_config)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     state_dict = torch.load(torch_path, map_location=device)
     lm_model.load_state_dict(state_dict, strict=False)
